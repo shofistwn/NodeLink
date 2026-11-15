@@ -1,12 +1,16 @@
 import { logger, makeRequest } from '../utils.js';
+const TIME_TAG_PATTERN = /\[(\d+):(\d{2})(?:[.:](\d{2,3}))?\]/g;
 export default class LrcRedLyrics {
     nodelink;
     proxyIndex = 0;
     constructor(nodelink) {
         this.nodelink = nodelink;
     }
+    async setup() {
+        return true;
+    }
     _getProxy() {
-        const sourceConfig = this.nodelink.options.lyrics?.lrcRed;
+        const sourceConfig = this.nodelink.options?.lyrics?.lrcRed;
         const custom = typeof sourceConfig === 'object' && sourceConfig !== null
             ? sourceConfig.proxy
             : undefined;
@@ -24,96 +28,65 @@ export default class LrcRedLyrics {
         return this.nodelink.proxyManager?.getBestProxy('lrcRed')?.target;
     }
     _reportProxy(proxy, success, statusCode) {
-        if (proxy?.url)
+        if (proxy?.url) {
             this.nodelink.proxyManager?.report?.(proxy.url, success, statusCode);
-    }
-    _parseTtml(ttml) {
-        const decode = (value) => value.replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (entity, token) => {
-            const named = {
-                amp: '&',
-                lt: '<',
-                gt: '>',
-                quot: '"',
-                apos: "'"
-            };
-            if (token[0] !== '#')
-                return named[token.toLowerCase()] ?? entity;
-            const code = token[1]?.toLowerCase() === 'x'
-                ? Number.parseInt(token.slice(2), 16)
-                : Number.parseInt(token.slice(1), 10);
-            return Number.isFinite(code) ? String.fromCodePoint(code) : entity;
-        });
-        const timeMs = (value) => {
-            if (!value)
-                return null;
-            const raw = value.trim();
-            if (/^\d+(?:\.\d+)?ms$/i.test(raw))
-                return Math.round(Number.parseFloat(raw));
-            if (/^\d+(?:\.\d+)?s$/i.test(raw))
-                return Math.round(Number.parseFloat(raw) * 1000);
-            const parts = raw.split(':').map(Number);
-            if (parts.some((part) => !Number.isFinite(part)))
-                return null;
-            const [hoursOrMinutes, minutesOrSeconds, seconds] = parts;
-            if (parts.length === 2 &&
-                hoursOrMinutes !== undefined &&
-                minutesOrSeconds !== undefined)
-                return Math.round((hoursOrMinutes * 60 + minutesOrSeconds) * 1000);
-            if (parts.length === 3 &&
-                hoursOrMinutes !== undefined &&
-                minutesOrSeconds !== undefined &&
-                seconds !== undefined)
-                return Math.round((hoursOrMinutes * 3600 + minutesOrSeconds * 60 + seconds) * 1000);
-            return null;
-        };
-        const lines = [];
-        const paragraphs = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
-        let paragraph = paragraphs.exec(ttml);
-        while (paragraph) {
-            const attrs = paragraph[1] ?? '';
-            const body = paragraph[2] ?? '';
-            const start = timeMs(attrs.match(/\bbegin=["']([^"']+)["']/i)?.[1]) ?? 0;
-            const end = timeMs(attrs.match(/\bend=["']([^"']+)["']/i)?.[1]);
-            const words = [];
-            let text = '';
-            let cursor = 0;
-            const spans = /<span\b([^>]*)>([\s\S]*?)<\/span>/gi;
-            let span = spans.exec(body);
-            while (span) {
-                text += decode(body.slice(cursor, span.index).replace(/<[^>]+>/g, ''));
-                const wordText = decode((span[2] ?? '').replace(/<[^>]+>/g, '')).trim();
-                const spanAttrs = span[1] ?? '';
-                const wordStart = timeMs(spanAttrs.match(/\bbegin=["']([^"']+)["']/i)?.[1]);
-                const wordEnd = timeMs(spanAttrs.match(/\bend=["']([^"']+)["']/i)?.[1]);
-                if (wordText) {
-                    text += wordText;
-                    if (wordStart !== null)
-                        words.push({
-                            text: wordText,
-                            time: wordStart,
-                            duration: wordEnd === null ? 0 : Math.max(0, wordEnd - wordStart)
-                        });
-                }
-                cursor = span.index + span[0].length;
-                span = spans.exec(body);
-            }
-            text += decode(body.slice(cursor).replace(/<[^>]+>/g, ''));
-            text = text.replace(/\s+/g, ' ').trim();
-            if (text)
-                lines.push({
-                    text,
-                    time: start,
-                    duration: end === null ? 0 : Math.max(0, end - start),
-                    ...(words.length ? { words } : {})
-                });
-            paragraph = paragraphs.exec(ttml);
         }
-        return lines.sort((left, right) => left.time - right.time);
     }
-    async setup() {
-        return true;
+    /**
+     * Applies line durations based on subsequent line timestamps.
+     */
+    _applyLineDurations(lines) {
+        const sortedLines = [...lines].sort((left, right) => left.time - right.time);
+        return sortedLines.map((line, index) => {
+            if (line.duration && line.duration > 0) {
+                return line;
+            }
+            const nextLine = sortedLines[index + 1];
+            return {
+                ...line,
+                duration: nextLine && nextLine.time > line.time ? nextLine.time - line.time : 0
+            };
+        });
+    }
+    /**
+     * Parses standard and enhanced LRC formatted lyrics line-by-line.
+     */
+    _parseLrc(lrc) {
+        const lines = [];
+        const rawLines = lrc.split(/\r?\n/);
+        for (const rawLine of rawLines) {
+            const timestamps = [];
+            let match = TIME_TAG_PATTERN.exec(rawLine);
+            while (match) {
+                const minutes = Number.parseInt(match[1] ?? '0', 10);
+                const seconds = Number.parseInt(match[2] ?? '0', 10);
+                const msText = (match[3] ?? '0').padEnd(3, '0').slice(0, 3);
+                const milliseconds = Number.parseInt(msText, 10);
+                timestamps.push(minutes * 60_000 + seconds * 1_000 + milliseconds);
+                match = TIME_TAG_PATTERN.exec(rawLine);
+            }
+            TIME_TAG_PATTERN.lastIndex = 0;
+            if (timestamps.length === 0)
+                continue;
+            // Strip time tags and inline word tags (<00:10.06>)
+            const text = rawLine
+                .replace(/\[\d+:\d{2}(?:[.:]\d{2,3})?\]/g, '')
+                .replace(/<\d+:\d{2}(?:[.:]\d{2,3})?>/g, '')
+                .trim();
+            if (text.length === 0)
+                continue;
+            for (const time of timestamps) {
+                lines.push({ text, time, duration: 0 });
+            }
+        }
+        return this._applyLineDurations(lines);
     }
     async getLyrics(track) {
+        const isrc = track.isrc?.replace(/[-\s]/g, '').trim();
+        // Strictly focus lookup on ISRC; immediately fallback to other providers if missing
+        if (!isrc) {
+            return { loadType: 'empty', data: {} };
+        }
         const proxy = this._getProxy();
         const headers = {
             accept: 'application/json, text/plain, */*',
@@ -130,29 +103,6 @@ export default class LrcRedLyrics {
             network: proxy ? { proxy } : undefined
         });
         try {
-            let isrc = track.isrc?.trim();
-            if (!isrc) {
-                const q = encodeURIComponent(`${track.author} ${track.title}`);
-                const search = await request(`https://lrc.red/search.json?q=${q}`);
-                if (search.error || search.statusCode !== 200) {
-                    this._reportProxy(proxy, false, search.statusCode ?? 0);
-                    return { loadType: 'empty', data: {} };
-                }
-                this._reportProxy(proxy, true, search.statusCode ?? 200);
-                const payload = (typeof search.body === 'string'
-                    ? JSON.parse(search.body)
-                    : search.body);
-                const hits = payload.hits ?? [];
-                const norm = (s) => (s ?? '')
-                    .toLowerCase()
-                    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-                    .trim();
-                const best = hits.find((hit) => norm(hit.title) === norm(track.title) &&
-                    norm(hit.artist) === norm(track.author)) ?? hits.find((hit) => norm(hit.title) === norm(track.title));
-                isrc = best?.isrc;
-            }
-            if (!isrc)
-                return { loadType: 'empty', data: {} };
             const pageUrl = `https://lrc.red/s/${encodeURIComponent(isrc)}`;
             const detailResponse = await request(`${pageUrl}.json`, pageUrl);
             if (detailResponse.error || detailResponse.statusCode !== 200) {
@@ -163,28 +113,36 @@ export default class LrcRedLyrics {
             const detail = (typeof detailResponse.body === 'string'
                 ? JSON.parse(detailResponse.body)
                 : detailResponse.body);
-            if (!detail.files?.ttml)
-                return { loadType: 'empty', data: {} };
-            const lyricsResponse = await request(detail.files.ttml, pageUrl);
-            if (lyricsResponse.error ||
-                lyricsResponse.statusCode !== 200 ||
-                typeof lyricsResponse.body !== 'string') {
-                this._reportProxy(proxy, false, lyricsResponse.statusCode ?? 0);
+            // If metadata explicitly indicates unsynced (plain/none) or missing LRC file, fallback
+            if (detail.sync === 'none' || !detail.files?.lrc) {
                 return { loadType: 'empty', data: {} };
             }
-            this._reportProxy(proxy, true, lyricsResponse.statusCode ?? 200);
-            const lines = this._parseTtml(lyricsResponse.body);
-            if (!lines.length)
+            const lrcResponse = await request(detail.files.lrc, pageUrl);
+            if (lrcResponse.error ||
+                lrcResponse.statusCode !== 200 ||
+                !lrcResponse.body) {
+                this._reportProxy(proxy, false, lrcResponse.statusCode ?? 0);
                 return { loadType: 'empty', data: {} };
+            }
+            this._reportProxy(proxy, true, lrcResponse.statusCode);
+            const bodyText = typeof lrcResponse.body === 'string'
+                ? lrcResponse.body
+                : String(lrcResponse.body);
+            const lines = this._parseLrc(bodyText);
+            // If no valid synced lines were found, return empty to fallback to other providers
+            if (!lines.length || !lines.some((line) => line.time > 0)) {
+                return { loadType: 'empty', data: {} };
+            }
             return {
                 loadType: 'lyrics',
                 data: {
-                    name: detail.title ?? track.title,
+                    name: detail.title || track.title,
                     synced: true,
                     lines,
                     attribution: {
                         name: 'lrc.red',
-                        url: detail.page ?? `https://lrc.red/s/${encodeURIComponent(isrc)}`
+                        url: detail.page ??
+                            `https://lrc.red/s/${encodeURIComponent(isrc)}`
                     }
                 }
             };
