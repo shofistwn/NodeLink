@@ -12,6 +12,7 @@
 !.gitignore
 !constants.js
 !Dockerfile
+!Makefile
 !LICENSE
 !package.json
 !README.md
